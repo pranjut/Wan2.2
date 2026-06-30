@@ -58,6 +58,7 @@ class WanS2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        load_text_encoder=True,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -84,6 +85,12 @@ class WanS2V:
             convert_model_dtype (`bool`, *optional*, defaults to False):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
+            load_text_encoder (`bool`, *optional*, defaults to True):
+                Whether to load the UMT5 text encoder (~6 GB). Set to False to
+                run a precompute-only pipeline that takes text embeddings as a
+                direct input to `generate()` via `prompt_embeds`. When False,
+                `generate()` must be called with precomputed `prompt_embeds`
+                (and `negative_prompt_embeds` when `guide_scale > 1`).
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
@@ -98,14 +105,22 @@ class WanS2V:
             self.init_on_cpu = False
 
         shard_fn = partial(shard_model, device_id=device_id)
-        self.text_encoder = T5EncoderModel(
-            text_len=config.text_len,
-            dtype=config.t5_dtype,
-            device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
-            shard_fn=shard_fn if t5_fsdp else None,
-        )
+        self.text_encoder = None
+        if load_text_encoder:
+            self.text_encoder = T5EncoderModel(
+                text_len=config.text_len,
+                dtype=config.t5_dtype,
+                device=torch.device('cpu'),
+                checkpoint_path=os.path.join(checkpoint_dir,
+                                             config.t5_checkpoint),
+                tokenizer_path=os.path.join(checkpoint_dir,
+                                            config.t5_tokenizer),
+                shard_fn=shard_fn if t5_fsdp else None,
+            )
+        else:
+            logging.info(
+                "Text encoder not loaded (load_text_encoder=False); "
+                "generate() expects precomputed prompt_embeds.")
 
         self.vae = Wan2_1_VAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
@@ -389,6 +404,80 @@ class WanS2V:
             HEIGHT, WIDTH, target_area=max_area)
         return (HEIGHT, WIDTH)
 
+    def _to_context_list(self, embeds):
+        """Normalize precomputed text embeddings into the
+        ``list[Tensor(L, 4096)]`` format produced by the T5 encoder, placed on
+        the compute device with the model's parameter dtype.
+
+        Accepts a single ``(L, C)`` tensor, a batched ``(B, L, C)`` tensor, or a
+        list/tuple of ``(L, C)`` tensors.
+        """
+        if isinstance(embeds, torch.Tensor):
+            if embeds.dim() == 3:
+                embeds = list(embeds)
+            elif embeds.dim() == 2:
+                embeds = [embeds]
+            else:
+                raise ValueError(
+                    "text embeds tensor must be 2D (L, C) or 3D (B, L, C), "
+                    f"got shape {tuple(embeds.shape)}")
+        elif isinstance(embeds, (list, tuple)):
+            embeds = list(embeds)
+        else:
+            raise TypeError(
+                "text embeds must be a torch.Tensor or a list of tensors, "
+                f"got {type(embeds)}")
+        return [
+            e.to(device=self.device, dtype=self.param_dtype) for e in embeds
+        ]
+
+    def _prepare_text_context(self, input_prompt, n_prompt, prompt_embeds,
+                              negative_prompt_embeds, need_null, offload_model):
+        """Return ``(context, context_null)`` as lists of T5-style embeddings.
+
+        When ``prompt_embeds`` is provided the T5 encoder is bypassed entirely;
+        otherwise the prompts are encoded on the fly (requires the encoder to
+        have been loaded). ``context_null`` is ``None`` when ``need_null`` is
+        ``False`` (i.e. ``guide_scale <= 1``).
+        """
+        # Encoder-free path: caller supplied precomputed embeddings.
+        if prompt_embeds is not None:
+            context = self._to_context_list(prompt_embeds)
+            if need_null:
+                if negative_prompt_embeds is None:
+                    raise ValueError(
+                        "guide_scale > 1 requires negative_prompt_embeds when "
+                        "prompt_embeds is supplied (no text encoder to fall "
+                        "back on).")
+                context_null = self._to_context_list(negative_prompt_embeds)
+            else:
+                context_null = None
+            return context, context_null
+
+        # Fallback path: encode with the T5 encoder.
+        if self.text_encoder is None:
+            raise RuntimeError(
+                "No text encoder loaded (load_text_encoder=False) and no "
+                "prompt_embeds provided. Pass precomputed prompt_embeds (and "
+                "negative_prompt_embeds when guide_scale > 1).")
+        if not self.t5_cpu:
+            self.text_encoder.model.to(self.device)
+            context = self.text_encoder([input_prompt], self.device)
+            context_null = self.text_encoder([n_prompt],
+                                             self.device) if need_null else None
+            if offload_model:
+                self.text_encoder.model.cpu()
+        else:
+            context = self.text_encoder([input_prompt], torch.device('cpu'))
+            context = [t.to(self.device) for t in context]
+            if need_null:
+                context_null = self.text_encoder([n_prompt],
+                                                 torch.device('cpu'))
+                context_null = [t.to(self.device) for t in context_null]
+            else:
+                context_null = None
+        return context, context_null
+
     def generate(
         self,
         input_prompt,
@@ -410,6 +499,8 @@ class WanS2V:
         seed=-1,
         offload_model=True,
         init_first_frame=False,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
     ):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
@@ -448,6 +539,16 @@ class WanS2V:
                 If True, offloads models to CPU during generation to save VRAM
             init_first_frame (`bool`, *optional*, defaults to False):
                 Whether to use the reference image as the first frame (i.e., standard image-to-video generation)
+            prompt_embeds (`torch.Tensor` or `list[torch.Tensor]`, *optional*):
+                Precomputed UMT5 text embeddings for the positive prompt, of
+                shape `(L, 4096)` (or `(1, L, 4096)` / a single-element list).
+                These are the raw text-encoder outputs (pre-projection); the
+                DiT applies its own 4096->dim projection internally. When given,
+                the T5 encoder is bypassed entirely (and need not be loaded).
+            negative_prompt_embeds (`torch.Tensor` or `list[torch.Tensor]`, *optional*):
+                Precomputed UMT5 text embeddings for the negative prompt, same
+                format as `prompt_embeds`. Required when `guide_scale > 1` and
+                `prompt_embeds` is supplied.
 
         Returns:
             torch.Tensor:
@@ -518,18 +619,15 @@ class WanS2V:
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
-        # preprocess
-        if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
-                self.text_encoder.model.cpu()
-        else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+        # text conditioning: prefer precomputed embeddings (encoder-free path),
+        # otherwise fall back to encoding with the (optional) T5 encoder.
+        context, context_null = self._prepare_text_context(
+            input_prompt=input_prompt,
+            n_prompt=n_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            need_null=guide_scale > 1,
+            offload_model=offload_model)
 
         out = []
         # evaluation mode

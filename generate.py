@@ -21,6 +21,25 @@ from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import merge_video_audio, save_video, str2bool
 
 
+def load_text_embeds(path):
+    """Load a precomputed text embedding from a .pt/.pth/.safetensors file.
+
+    Returns a tensor of shape (L, 4096) (the raw UMT5 encoder output). For
+    safetensors, the first stored tensor is used (or a tensor keyed
+    'prompt_embeds'/'embeds' if present).
+    """
+    if path is None:
+        return None
+    if path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        tensors = load_file(path)
+        for key in ("prompt_embeds", "embeds", "context"):
+            if key in tensors:
+                return tensors[key]
+        return next(iter(tensors.values()))
+    return torch.load(path, map_location="cpu")
+
+
 EXAMPLE_PROMPT = {
     "t2v-A14B": {
         "prompt":
@@ -78,6 +97,13 @@ def _validate_args(args):
 
     if args.task == "i2v-A14B":
         assert args.image is not None, "Please specify the image path for i2v."
+
+    if args.no_text_encoder or args.prompt_embeds is not None:
+        assert 's2v' in args.task, \
+            "--no_text_encoder/--prompt_embeds are only supported for s2v tasks."
+    if args.no_text_encoder:
+        assert args.prompt_embeds is not None, \
+            "--no_text_encoder requires --prompt_embeds (precomputed text embeddings)."
 
     cfg = WAN_CONFIGS[args.task]
 
@@ -294,6 +320,25 @@ def _parse_args():
         default=80,
         help="Number of frames per clip, 48 or 80 or others (must be multiple of 4) for 14B s2v"
     )
+    parser.add_argument(
+        "--no_text_encoder",
+        action="store_true",
+        default=False,
+        help="(s2v) Skip loading the UMT5 text encoder (~6 GB). Requires "
+        "--prompt_embeds to supply precomputed text embeddings.")
+    parser.add_argument(
+        "--prompt_embeds",
+        type=str,
+        default=None,
+        help="(s2v) Path to a precomputed positive-prompt text embedding "
+        "(.pt/.pth/.safetensors), shape (L, 4096). Bypasses the T5 encoder.")
+    parser.add_argument(
+        "--negative_prompt_embeds",
+        type=str,
+        default=None,
+        help="(s2v) Path to a precomputed negative-prompt text embedding "
+        "(.pt/.pth/.safetensors). Required with --prompt_embeds when "
+        "sample_guide_scale > 1.")
     args = parser.parse_args()
     _validate_args(args)
 
@@ -491,8 +536,11 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            load_text_encoder=not args.no_text_encoder,
         )
         logging.info(f"Generating video ...")
+        prompt_embeds = load_text_embeds(args.prompt_embeds)
+        negative_prompt_embeds = load_text_embeds(args.negative_prompt_embeds)
         video = wan_s2v.generate(
             input_prompt=args.prompt,
             ref_image_path=args.image,
@@ -512,6 +560,8 @@ def generate(args):
             seed=args.base_seed,
             offload_model=args.offload_model,
             init_first_frame=args.start_from_ref,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
         )
     else:
         logging.info("Creating WanI2V pipeline.")
